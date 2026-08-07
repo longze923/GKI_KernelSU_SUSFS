@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional, Callable
 from dataclasses import dataclass, field
 
-from config import (BuildConfig, KSUVersion, KSU_REPO_CONFIG, SUSFS_REPO_CONFIG, SUKISU_PATCH_REPO_CONFIG,
+from config import (BuildConfig, KSU_REPO_CONFIG, SUSFS_REPO_CONFIG, SUKISU_PATCH_REPO_CONFIG,
                    ANYKERNEL_CONFIG, KERNEL_PATCHES_CONFIG, BBG_CONFIG, TOOLCHAIN_CONFIG,
                    LEGACY_FIXES, OP8E_PATCH_URL, KPM_PATCH_URL)
 
@@ -251,12 +251,8 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
     def add_kernelsu(self):
         logger.info("=== 添加 KernelSU ===")
         self._chdir(self.work_dir)
-        if self.config.kernelsu_commit:
-            setup_url = f"https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/{self.config.kernelsu_commit}/kernel/setup.sh"
-        else:
-            # Dev(开发) 使用 dev 分支，与 ksu-hide-module 的注入锚点保持一致
-            ksu_branch = "dev" if self.config.kernelsu_version == KSUVersion.DEV.value else "main"
-            setup_url = f"https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/{ksu_branch}/kernel/setup.sh"
+        setup_url = (f"https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/{self.config.kernelsu_commit}/kernel/setup.sh"
+                     if self.config.kernelsu_commit else KSU_REPO_CONFIG["setup_script"])
         self._run_cmd(f"curl -LSs {setup_url} | bash -s builtin", check=False)
         if self.config.kernelsu_commit:
             ksu_dir = self.work_dir / "KernelSU"
@@ -467,53 +463,19 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         subprocess.run(cmd, shell=True, cwd=str(self.work_dir), env=env, check=True, timeout=900)
         logger.info("KSU Hide Module 注入完成")
 
-    def apply_gki_assoc_array_fix(self):
-        """GKI 5.15：fragment 会把 CONFIG_ASSOCIATIVE_ARRAY 强制关掉，但 CONFIG_KEYS=y 时
-        key.h 需要 struct assoc_array、keyring.c 需要 assoc_array API。
-        这里把 assoc_array 头文件与 lib 实现改为跟随 CONFIG_KEYS 编译，
-        等价于恢复 KEYS 对 ASSOCIATIVE_ARRAY 的 select。"""
-        common_dir = self.work_dir / "common"
-        header = common_dir / "include/linux/assoc_array.h"
-        if header.exists():
-            text = header.read_text(encoding="utf-8", errors="replace")
-            new = text.replace(
-                "#ifdef CONFIG_ASSOCIATIVE_ARRAY",
-                "#if defined(CONFIG_ASSOCIATIVE_ARRAY) || defined(CONFIG_KEYS)",
-                1,
-            )
-            if new != text:
-                header.write_text(new, encoding="utf-8")
-                logger.info("assoc_array.h: struct/API 跟随 CONFIG_KEYS 编译")
-            else:
-                logger.warning("assoc_array.h: 未找到 #ifdef CONFIG_ASSOCIATIVE_ARRAY")
-
-        lib_makefile = common_dir / "lib/Makefile"
-        if lib_makefile.exists():
-            text = lib_makefile.read_text(encoding="utf-8", errors="replace")
-            new = text.replace(
-                "obj-$(CONFIG_ASSOCIATIVE_ARRAY) += assoc_array.o",
-                "obj-$(CONFIG_KEYS) += assoc_array.o",
-                1,
-            )
-            if new != text:
-                lib_makefile.write_text(new, encoding="utf-8")
-                logger.info("lib/Makefile: assoc_array.o 跟随 CONFIG_KEYS 编译")
-            else:
-                logger.warning("lib/Makefile: 未找到 assoc_array.o 规则")
-
     def apply_zram_patches(self):
         if not self.config.use_zram:
             return
         logger.info("=== 应用 ZRAM (LZ4KD) 补丁 ===")
         self._chdir(self.work_dir / "common")
-        for src in [
+        for src, dst in [
             (self.sukisu_patch_dir / "other/zram/lz4k/include/linux", "include/linux/"),
             (self.sukisu_patch_dir / "other/zram/lz4k/lib", "lib/"),
             (self.sukisu_patch_dir / "other/zram/lz4k/crypto", "crypto/"),
-            (self.sukisu_patch_dir / "other/zram/lz4k_oplus", "lib/"),
+            (self.sukisu_patch_dir / "other/zram/lz4k_oplus", "lib/lz4k_oplus/"),
         ]:
-            if src[0].exists():
-                self._run_cmd(f"cp -r {src[0]}/* {src[1]}", check=False)
+            if src.exists():
+                self._run_cmd(f"mkdir -p {dst} && cp -r {src}/* {dst}", check=False)
         zram_patch_dir = self.sukisu_patch_dir / f"other/zram/zram_patch/{self.config.kernel_version}"
         for patch in ["lz4kd.patch", "lz4k_oplus.patch"]:
             p = zram_patch_dir / patch
@@ -571,22 +533,9 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
                 f.write("CONFIG_KSU_SUSFS_SUS_PATH=y\n")
             else:
                 f.write("CONFIG_KSU_SUSFS_SUS_PATH=n\n")
-            # GKI 5.15 的 key.h 在 CONFIG_KEYS=y 时无条件使用 struct assoc_array，
-            # 结构体定义由 assoc_array.h 里的 #ifdef 符号控制（不同内核版本可能是
-            # CONFIG_ASSOCIATIVE_ARRAY 或旧名 CONFIG_ASSOC_ARRAY），按实际源码开启
+            # CONFIG_KEYS 会 select ASSOCIATIVE_ARRAY；此前 lib/Kconfig 被 zram 的
+            # lz4k_oplus 覆盖导致该符号消失，修复复制路径后由 Kconfig select 自动开启
             f.write("CONFIG_KEYS=y\n")
-            assoc_h = self.work_dir / "common/include/linux/assoc_array.h"
-            if assoc_h.exists():
-                assoc_text = assoc_h.read_text(encoding="utf-8", errors="replace")
-                m = re.search(r'#\s*ifdef\s+(CONFIG_[A-Z_]+)[^\n]*\n(?:[^\n]*\n)*?\s*struct assoc_array\s*\{', assoc_text)
-                if m:
-                    sym = m.group(1)
-                    f.write(f"{sym}=y\n")
-                    logger.info(f"assoc_array 由 {sym} 控制，已显式开启")
-                else:
-                    logger.warning("assoc_array.h 中未找到 struct assoc_array 的 #ifdef，跳过")
-            else:
-                logger.warning("assoc_array.h 不存在，跳过")
 
         if self.config.use_zram:
             self._configure_zram()
@@ -914,7 +863,6 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             self.apply_susfs_patches()
             self.apply_sukisu_patches()
             self.apply_hide_module()
-            self.apply_gki_assoc_array_fix()
             self.apply_zram_patches()
             self.apply_task_mmu_fixes()
             self.configure_kernel()

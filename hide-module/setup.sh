@@ -923,24 +923,37 @@ inject_code "$FTRACE" \
     'ksu_tracing_line_filter(m->buf' \
     't_show (tracing line filter)'
 
-# --- 27. SukiSU reboot 魔数侧信道拦截 — drivers/kernelsu/supercall/supercall.c
-# SukiSU 在 __arm64_sys_reboot 挂了无信任检查的 kprobe：任何进程带
-# KSU 魔数调 reboot 都会调度 fd 安装（侧信道）。这里在 reboot_handler_pre
-# 入口加早退：uid>=10000 的不可信调用者直接 return 0，不触发侧信道。
-# ksud(root) 与系统进程(uid<10000)不受影响。
+# --- 27. SukiSU reboot 魔数侧信道拦截（适配官方 builtin/b1d534bc）
+# SukiSU 在 __arm64_sys_reboot 挂 KSU 魔数处理：任何进程带 KSU 魔数调 reboot
+# 都会调度 fd 安装（侧信道）。在入口加早退：uid>=10000 的不可信调用者直接拒绝，
+# 不触发侧信道。ksud(root) 与系统进程(uid<10000)不受影响。
+# builtin(b1d534bc)：ksu_handle_sys_reboot 在 drivers/kernelsu/supercall/dispatch.c，
+#   KSU_INSTALL_MAGIC2 分支无 uid 检查，在函数入口注入早退。
+# dev(2af38be5)：reboot_handler_pre kprobe 入口注入早退（旧锚点仅作回退）。
+SUPERCALL_DISPATCH="${KERNEL_COMMON}/drivers/kernelsu/supercall/dispatch.c"
 SUPERCALL="${KERNEL_COMMON}/drivers/kernelsu/supercall/supercall.c"
 
-inject_code "$SUPERCALL" \
-    '#include <linux/anon_inodes.h>' \
-    '#include <linux/cred.h>' \
-    '#include <linux/cred.h>' \
-    'supercall include cred'
+if [ -f "$SUPERCALL_DISPATCH" ] && grep -q 'int ksu_handle_sys_reboot(' "$SUPERCALL_DISPATCH"; then
+    # 官方 builtin 分支：dispatch.c 已使用 current_uid()，无需额外 include
+    inject_after_decls "$SUPERCALL_DISPATCH" \
+        'int ksu_handle_sys_reboot(' \
+        'if (current_uid().val >= 10000) return -EPERM;' \
+        'current_uid().val >= 10000' \
+        'ksu_handle_sys_reboot (block untrusted reboot magic)'
+else
+    # dev 分支回退：reboot kprobe 入口
+    inject_code "$SUPERCALL" \
+        '#include <linux/anon_inodes.h>' \
+        '#include <linux/cred.h>' \
+        '#include <linux/cred.h>' \
+        'supercall include cred'
 
-inject_after_decls "$SUPERCALL" \
-    'static int reboot_handler_pre(' \
-    'if (current_uid().val >= 10000) return 0;' \
-    'current_uid().val >= 10000' \
-    'reboot_handler_pre (block untrusted reboot magic)'
+    inject_after_decls "$SUPERCALL" \
+        'static int reboot_handler_pre(' \
+        'if (current_uid().val >= 10000) return 0;' \
+        'current_uid().val >= 10000' \
+        'reboot_handler_pre (block untrusted reboot magic)'
+fi
 
 # ===========================================================================
 # 结果汇总
