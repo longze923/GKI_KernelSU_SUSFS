@@ -1,0 +1,138 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# KSU Stealth Hide Module — Kconfig
+#
+# 三层防御架构：
+#   Layer 1: 编译期字符串混淆 (KSU_OBF) — 关键词不出现在 .rodata
+#   Layer 2: 运行时 hash 比较 (FNV-1a) — 不用 strstr/strcmp
+#   Layer 3: 强化调用者认证 — UID + anti-debug + 启动时间窗
+#
+# 该模块通过 ABK 自定义外部模块机制集成到 GKI 内核编译流程中。
+
+menu "KSU Stealth Hide Module"
+
+config KSU_HIDE
+	bool "Enable KSU Stealth Hide Module"
+	default y
+	help
+	  极致隐藏性内核模块，为 KernelSU/SukiSU/ReSukiSU 提供全面的
+	  反检测能力。
+
+	  包含以下子模块：
+	    - 进程/线程隐藏 (/proc/pid, kill, pidfd, tgkill)
+	    - 挂载信息过滤 (/proc/mounts, mountinfo, mountstats, filesystems)
+	    - 网络 socket 隐藏 (/proc/net/*, SOCK_DIAG)
+	    - /proc/status 伪装 (TracerPid, CapEff, Uid/Gid, comm, stat)
+	    - namespace mtime 对齐 (对抗 magic_delta 检测)
+	    - kprobe/debugfs/ftrace 痕迹清理
+	    - 页驻留探针防御 (mincore/madvise)
+	    - /proc/iomem 伪装
+	    - wchan 伪装
+	    - 时间源多时钟一致性
+
+	  Say Y if you want to enable stealth features.
+
+config KSU_HIDE_STEALTH_CORE
+	bool "KSU Stealth Core (required)"
+	depends on KSU_HIDE
+	default y
+	help
+	  核心模块：编译期字符串混淆、FNV-1a hash 比较、调用者认证、
+	  anti-debug 检测、时序侧信道防护。所有子模块的依赖。
+
+config KSU_HIDE_STRING_GUARD
+	bool "String Guard — keyword hash management"
+	depends on KSU_HIDE
+	default y
+	help
+	  集中管理所有隐藏关键词的 hash 常量与匹配函数。
+	  进程名、kprobe 符号、模块名、mounts 关键词。
+
+config KSU_HIDE_PROCESS
+	bool "Process Hiding"
+	depends on KSU_HIDE
+	default y
+	help
+	  进程隐藏：/proc/pid 枚举、kill/pidfd/tgkill 探测防御、
+	  kill/pidfd/tgkill 探测防御、线程枚举过滤。
+
+config KSU_HIDE_PROC_PID
+	bool "/proc PID Filter"
+	depends on KSU_HIDE
+	default y
+	help
+	  /proc PID 目录枚举过滤 (fs/proc/base.c 注入)
+
+config KSU_HIDE_MOUNTS
+	bool "Mounts Filter"
+	depends on KSU_HIDE
+	default y
+	help
+	  /proc/mounts, mountinfo, mountstats, filesystems 行级过滤
+
+config KSU_HIDE_NET
+	bool "Network Socket Hiding"
+	depends on KSU_HIDE
+	default y
+	help
+	  网络 socket 隐藏：/proc/net/*, SOCK_DIAG (inet_diag/unix_diag)
+
+config KSU_HIDE_STATUS
+	bool "Status Spoofing"
+	depends on KSU_HIDE
+	default y
+	help
+	  /proc/self/status 伪装 (TracerPid, CapEff), stat 伪装, comm 伪装
+
+config KSU_HIDE_NS_MTIME
+	bool "Namespace mtime Alignment"
+	depends on KSU_HIDE
+	default y
+	help
+	  namespace inode mtime 对齐 (对抗 magic_delta 检测)
+
+config KSU_HIDE_DEBUGFS
+	bool "Debugfs Cleanup"
+	depends on KSU_HIDE
+	default y
+	help
+	  kprobe/debugfs/ftrace 痕迹清理、kallsyms/proc/modules 过滤
+
+config KSU_HIDE_AP_KER
+	bool "Page Probe Defense"
+	depends on KSU_HIDE
+	default y
+	help
+	  页驻留探针防御 (madvise 记录 + mincore 掩蔽)
+
+config KSU_HIDE_IOMEM
+	bool "IO Mem / Cmdline Spoofing"
+	depends on KSU_HIDE
+	default y
+	help
+	  /proc/iomem 伪装
+
+config KSU_HIDE_SYSCALL
+	bool "Syscall Integrity"
+	depends on KSU_HIDE
+	default y
+	help
+	  wchan 伪装
+
+config KSU_HIDE_TIME
+	bool "Time Source Consistency"
+	depends on KSU_HIDE
+	default y
+	help
+	  时间源多时钟一致性 (uptime, stat, clock_gettime)
+
+config KSU_HIDE_SYSFS
+	bool "Runtime switch variables (no sysfs interface)"
+	depends on KSU_HIDE
+	default y
+	help
+	 仅保留各子模块的运行时开关变量（默认全部开启）。
+	 原 /sys/kernel/ksu_hide/ 运行时接口已移除：该接口的
+	 module_init 被定位为导致部分设备开机卡第一屏的原因。
+	 如需运行时调节，需要重新实现 sysfs 接口。
+endmenu

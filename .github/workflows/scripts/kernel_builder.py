@@ -100,6 +100,9 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
     ZRAM_CONFIG_5_10 = "CONFIG_ZSMALLOC=y\nCONFIG_ZRAM=y\nCONFIG_MODULE_SIG=n\nCONFIG_CRYPTO_LZO=y\nCONFIG_ZRAM_DEF_COMP_LZ4KD=y\n"
     ZRAM_CONFIG_COMMON = "CONFIG_CRYPTO_LZ4HC=y\nCONFIG_CRYPTO_LZ4K=y\nCONFIG_CRYPTO_LZ4KD=y\nCONFIG_CRYPTO_842=y\nCONFIG_CRYPTO_LZ4K_OPLUS=y\nCONFIG_ZRAM_WRITEBACK=y\n"
 
+    # 内置的 KSU 隐藏模块（随本仓库分发，见 hide-module/）
+    HIDE_MODULE_DIR = Path(__file__).resolve().parents[3] / "hide-module"
+
     def __init__(self, config: BuildConfig, workspace: str):
         self.config = config
         self.workspace = Path(workspace)
@@ -307,6 +310,20 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         hooks_patch = self.sukisu_patch_dir / "69_hide_stuff.patch"
         if hooks_patch.exists():
             self._run_cmd(f"cp {hooks_patch} . && patch -p1 -F 3 < 69_hide_stuff.patch", check=False)
+
+    def apply_hide_module(self):
+        logger.info("=== 注入 KSU Hide Module ===")
+        hide_setup = self.HIDE_MODULE_DIR / "setup.sh"
+        if not hide_setup.exists():
+            logger.warning(f"hide-module 未找到（{hide_setup}），跳过")
+            return
+        env = os.environ.copy()
+        env["KERNEL_ROOT"] = str(self.work_dir)
+        env["DEFCONFIG"] = str(self.work_dir / "common/arch/arm64/configs/gki_defconfig")
+        cmd = f"bash {hide_setup}"
+        logger.info(f"执行: {cmd}")
+        subprocess.run(cmd, shell=True, cwd=str(self.work_dir), env=env, check=True, timeout=900)
+        logger.info("KSU Hide Module 注入完成")
 
     def apply_zram_patches(self):
         if not self.config.use_zram:
@@ -704,6 +721,7 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             self.add_bbg()
             self.apply_susfs_patches()
             self.apply_sukisu_patches()
+            self.apply_hide_module()
             self.apply_zram_patches()
             self.apply_task_mmu_fixes()
             self.configure_kernel()

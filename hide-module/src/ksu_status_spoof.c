@@ -1,0 +1,215 @@
+// /proc/self/status 伪装模块
+//
+// 目标：
+// 1. TracerPid: 对目标进程返回 0（隐藏 ptrace / 反调试检测）
+// 2. CapEff/CapPrm: 对目标进程隐藏 root 进程的额外能力
+// 3. Uid/Gid: 如果隐藏进程的 uid=0，伪装为普通 uid
+// 4. /proc/self/cmdline: 对隐藏进程返回伪装的 comm
+//
+// 同时覆盖 /proc/<pid>/stat 的相关字段
+//
+// 所有关键词使用编译期混淆宏，明文不出现在 .rodata
+
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/init.h>
+#include <linux/fs.h>
+#include <linux/seq_file.h>
+#include <linux/sched.h>
+#include <linux/cred.h>
+#include <linux/string.h>
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+
+#include "ksu_stealth_core.h"
+
+// 外部符号
+extern bool caller_should_see_hidden(void);
+extern bool is_hidden_pid(pid_t pid);
+
+// 编译期混淆的字符串常量
+// "TracerPid:\t0\n" — 长度 15
+KSU_OBF_DECL(ksu_tracerpid_zero, "TracerPid:\t0\n");
+// "CapEff:\t0000000000000000\n" — 长度 27
+KSU_OBF_DECL(ksu_capeff_zero, "CapEff:\t0000000000000000\n");
+
+// ---- 2. /proc/self/status 行级过滤 ----
+// 对 status 的每一行做关键词过滤
+// 过滤的内容包括：
+//   - TracerPid: 非零值 → 改为 0
+//   - 含隐藏进程 PID 的行
+//   - CapEff/CapPrm 异常值（root 进程的全能位）
+bool ksu_status_line_filter(const char *line, size_t len, char **replacement)
+{
+    char buf[32];
+
+    KSU_MODULE_CHECK(ksu_hide_status_enabled);
+
+    if (caller_should_see_hidden())
+        return false;
+    if (!line || len == 0)
+        return false;
+
+    if (replacement)
+        *replacement = NULL;
+
+    // TracerPid: 非零 → 伪造为 0
+    // 用 hash 比较，避免明文 "TracerPid:" 出现在 .rodata
+    if (len >= 10) {
+        u64 line_hash = ksu_fnv1a(line, 10);
+        if (line_hash == KSU_FNV1A_CONST("TracerPid:")) {
+            // 检查是否有非零 TracerPid
+            const char *p = line + 10;
+            while (*p == ' ' || *p == '\t')
+                p++;
+            if (*p != '0') {
+                // 非零 TracerPid，替换
+                if (replacement) {
+                    KSU_DEOBF(ksu_tracerpid_zero, buf);
+                    *replacement = kstrdup(buf, GFP_KERNEL);
+                    KSU_WIPE(buf);
+                }
+                return true;
+            }
+        }
+    }
+
+    // CapEff: 如果是全能位 (0xffffffffffffffff) → 伪装为普通进程的能力
+    if (len >= 7) {
+        u64 line_hash = ksu_fnv1a(line, 7);
+        if (line_hash == KSU_FNV1A_CONST("CapEff:")) {
+            const char *p = line + 7;
+            bool all_f;
+            int count;
+            const char *q;
+            while (*p == ' ' || *p == '\t')
+                p++;
+            // 检查是否全 f（root 全能）；只接受 f/F 字符
+            all_f = true;
+            count = 0;
+            q = p;
+            while (*q && *q != '\n' && count < 20) {
+                if (*q != 'f' && *q != 'F') {
+                    all_f = false;
+                    break;
+                }
+                q++;
+                count++;
+            }
+            if (all_f && count >= 16) {
+                // 伪装为普通 app 的 CapEff (0x0000000000000000)
+                if (replacement) {
+                    KSU_DEOBF(ksu_capeff_zero, buf);
+                    *replacement = kstrdup(buf, GFP_KERNEL);
+                    KSU_WIPE(buf);
+                }
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+EXPORT_SYMBOL_GPL(ksu_status_line_filter);
+
+/* ---- 2b. 整段 status 缓冲区逐行过滤（原地压缩） ----
+ *
+ * 在 proc_pid_status 输出完成后、返回前调用：
+ * 对 m->buf[0..*count) 逐行执行 ksu_status_line_filter，
+ * 需要替换的行写入 replacement，无需替换的行原样保留，
+ * 最后更新 *count 为压缩后的长度（seq_file 只输出 count 内的内容）。
+ */
+void ksu_status_buffer_filter(char *buf, size_t *count)
+{
+    size_t src = 0;
+    size_t dst = 0;
+
+    if (!buf || !count)
+        return;
+
+    if (!atomic_read(&ksu_hide_status_enabled))
+        return;
+
+    if (caller_should_see_hidden())
+        return;
+
+    while (src < *count) {
+        size_t eol = src;
+        size_t line_len;
+        char *replacement = NULL;
+        bool filtered;
+
+        while (eol < *count && buf[eol] != '\n')
+            eol++;
+        if (eol < *count)
+            eol++; /* 包含换行符 */
+
+        line_len = eol - src;
+        filtered = ksu_status_line_filter(buf + src, line_len, &replacement);
+
+        if (filtered) {
+            if (replacement) {
+                size_t rlen = strlen(replacement);
+                memmove(buf + dst, replacement, rlen);
+                dst += rlen;
+                kfree(replacement);
+            }
+            /* filtered 且无 replacement → 整行丢弃 */
+        } else {
+            memmove(buf + dst, buf + src, line_len);
+            dst += line_len;
+        }
+
+        src = eol;
+    }
+
+    *count = dst;
+}
+EXPORT_SYMBOL_GPL(ksu_status_buffer_filter);
+
+// ---- 4. /proc/<pid>/comm 伪装 ----
+// 隐藏进程的 comm 改为普通系统进程名
+// 假进程名使用编译期混淆，不出现在 .rodata
+KSU_OBF_DECL(ksu_fake_comm_0, "kworker/u8:2");
+KSU_OBF_DECL(ksu_fake_comm_1, "kworker/0:1H");
+KSU_OBF_DECL(ksu_fake_comm_2, "system_server");
+
+bool ksu_comm_spoof(pid_t pid, char *comm, size_t comm_len)
+{
+    char buf[24];
+    static atomic_t fake_idx = ATOMIC_INIT(0);
+    int idx;
+
+    KSU_MODULE_CHECK(ksu_hide_status_enabled);
+
+    if (caller_should_see_hidden())
+        return false;
+
+    if (!is_hidden_pid(pid))
+        return false;
+
+    if (!comm || comm_len == 0)
+        return false;
+
+    idx = atomic_inc_return(&fake_idx) - 1;
+
+    switch (idx % 3) {
+    case 0:
+        KSU_DEOBF(ksu_fake_comm_0, buf);
+        break;
+    case 1:
+        KSU_DEOBF(ksu_fake_comm_1, buf);
+        break;
+    case 2:
+        KSU_DEOBF(ksu_fake_comm_2, buf);
+        break;
+    }
+    strncpy(comm, buf, comm_len - 1);
+    comm[comm_len - 1] = '\0';
+    KSU_WIPE(buf);
+
+    return true;
+}
+EXPORT_SYMBOL_GPL(ksu_comm_spoof);
+
+MODULE_LICENSE("GPL");
