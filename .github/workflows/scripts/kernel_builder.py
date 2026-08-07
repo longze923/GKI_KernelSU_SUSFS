@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional, Callable
 from dataclasses import dataclass, field
 
-from config import (BuildConfig, KSU_REPO_CONFIG, SUSFS_REPO_CONFIG, SUKISU_PATCH_REPO_CONFIG,
+from config import (BuildConfig, KSUVersion, KSU_REPO_CONFIG, SUSFS_REPO_CONFIG, SUKISU_PATCH_REPO_CONFIG,
                    ANYKERNEL_CONFIG, KERNEL_PATCHES_CONFIG, BBG_CONFIG, TOOLCHAIN_CONFIG,
                    LEGACY_FIXES, OP8E_PATCH_URL, KPM_PATCH_URL)
 
@@ -251,8 +251,12 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
     def add_kernelsu(self):
         logger.info("=== 添加 KernelSU ===")
         self._chdir(self.work_dir)
-        setup_url = (f"https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/{self.config.kernelsu_commit}/kernel/setup.sh"
-                    if self.config.kernelsu_commit else KSU_REPO_CONFIG["setup_script"])
+        if self.config.kernelsu_commit:
+            setup_url = f"https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/{self.config.kernelsu_commit}/kernel/setup.sh"
+        else:
+            # Dev(开发) 使用 dev 分支，与 ksu-hide-module 的注入锚点保持一致
+            ksu_branch = "dev" if self.config.kernelsu_version == KSUVersion.DEV.value else "main"
+            setup_url = f"https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/{ksu_branch}/kernel/setup.sh"
         self._run_cmd(f"curl -LSs {setup_url} | bash -s builtin", check=False)
         if self.config.kernelsu_commit:
             ksu_dir = self.work_dir / "KernelSU"
@@ -533,6 +537,10 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
                 f.write("CONFIG_KSU_SUSFS_SUS_PATH=y\n")
             else:
                 f.write("CONFIG_KSU_SUSFS_SUS_PATH=n\n")
+            # GKI 5.15 的 key.h 在 CONFIG_KEYS=y 时无条件使用 struct assoc_array，
+            # 结构体定义由 CONFIG_ASSOCIATIVE_ARRAY 控制，必须显式开启
+            f.write("CONFIG_KEYS=y\n")
+            f.write("CONFIG_ASSOCIATIVE_ARRAY=y\n")
 
         if self.config.use_zram:
             self._configure_zram()
