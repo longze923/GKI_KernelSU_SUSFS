@@ -445,6 +445,14 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
     def apply_sukisu_patches(self):
         logger.info("=== 应用 SukiSU 补丁 ===")
         self._chdir(self.work_dir / "common")
+        # 69_hide_stuff.patch（2024-12）的 task_mmu.c 锚点已随 SUSFS 2026-07
+        # OPEN_REDIRECT 重构而失配，-F 3 会错位注入并破坏 show_map_vma 结构，
+        # 触发 dentry 未初始化编译错误。该补丁仅伪装 lineage/jit-zygote-cache
+        # 映射名，价值低且与隐藏模块重叠，android13-5.15 直接跳过。
+        fb = f"{self.config.android_version}-{self.config.kernel_version}"
+        if fb == "android13-5.15":
+            logger.info("跳过 69_hide_stuff.patch（android13-5.15：SUSFS 重构后锚点失配）")
+            return
         hooks_patch = self.sukisu_patch_dir / "69_hide_stuff.patch"
         if hooks_patch.exists():
             self._run_cmd(f"cp {hooks_patch} . && patch -p1 -F 3 < 69_hide_stuff.patch", check=False)
@@ -462,6 +470,94 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         logger.info(f"执行: {cmd}")
         subprocess.run(cmd, shell=True, cwd=str(self.work_dir), env=env, check=True, timeout=900)
         logger.info("KSU Hide Module 注入完成")
+
+    def run_external_modules(self, stage: str):
+        """执行 ABK 风格的外部模块（清单由 workflow 生成，格式与 ABK 兼容：
+        stage<TAB>module_dir<TAB>repo_url<TAB>entry_kind<TAB>child_id）。"""
+        manifest = os.environ.get("CUSTOM_EXTERNAL_MODULES_MANIFEST")
+        if not manifest:
+            manifest = str(self.workspace / "custom_external_modules.tsv")
+        manifest_path = Path(manifest)
+        if not manifest_path.exists():
+            return
+        executed = 0
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw or raw.startswith("#"):
+                    continue
+                parts = raw.split("\t")
+                if len(parts) < 2:
+                    continue
+                mod_stage, module_dir = parts[0], parts[1]
+                if mod_stage != stage:
+                    continue
+                setup = Path(module_dir) / "setup.sh"
+                if not setup.exists():
+                    raise RuntimeError(f"外部模块缺少 setup.sh: {module_dir}")
+                env = os.environ.copy()
+                env["KERNEL_ROOT"] = str(self.work_dir)
+                env["KERNEL_COMMON"] = str(self.work_dir / "common")
+                env["DEFCONFIG"] = str(self.work_dir / "common/arch/arm64/configs/gki_defconfig")
+                env["ANDROID_VERSION"] = self.config.android_version
+                env["KERNEL_VERSION"] = self.config.kernel_version
+                env["SUB_LEVEL"] = self.config.sub_level
+                env["OS_PATCH_LEVEL"] = self.config.os_patch_level
+                env["KSU_VERSION"] = self.config.kernelsu_version
+                logger.info(f"执行外部模块 [{stage}]: {module_dir}")
+                subprocess.run(f"bash {setup}", shell=True, cwd=str(module_dir), env=env,
+                               check=True, timeout=900)
+                executed += 1
+        if executed:
+            logger.info(f"外部模块 [{stage}] 执行完成，共 {executed} 个")
+
+    def verify_patched_tree(self):
+        """编译前注入审计：在编译开始前检查补丁/注入是否被静默错位或失败，
+        把 10 分钟后的编译错误提前到几秒内暴露。"""
+        logger.info("=== 编译前注入审计 ===")
+        common_dir = self.work_dir / "common"
+        problems = []
+
+        # 1) 任何 patch 失败残留的 .rej 都是硬错误
+        rejects = sorted(common_dir.rglob("*.rej"))
+        if rejects:
+            names = ", ".join(str(p.relative_to(common_dir)) for p in rejects[:20])
+            problems.append(f"发现 patch 失败残留 .rej 文件: {names}")
+
+        # 2) lib/Kconfig 必须保留 vdso 子配置（防止 zram 复制覆盖）
+        lib_kconfig = common_dir / "lib/Kconfig"
+        if lib_kconfig.exists():
+            kconfig_text = lib_kconfig.read_text(encoding="utf-8", errors="replace")
+            if 'source "lib/vdso/Kconfig"' not in kconfig_text:
+                problems.append('lib/Kconfig 缺少 source "lib/vdso/Kconfig"（zram 补丁可能覆盖了它）')
+
+        # 3) lib/Makefile 必须保留 assoc_array 规则（同上）
+        lib_makefile = common_dir / "lib/Makefile"
+        if lib_makefile.exists():
+            makefile_text = lib_makefile.read_text(encoding="utf-8", errors="replace")
+            if "assoc_array" not in makefile_text:
+                problems.append("lib/Makefile 缺少 assoc_array 编译规则（zram 补丁可能覆盖了它）")
+
+        # 4) arm64 vdso 必须保留 -include gettimeofday.c 机制
+        vdso_mk = common_dir / "arch/arm64/kernel/vdso/Makefile"
+        if vdso_mk.exists():
+            vdso_text = vdso_mk.read_text(encoding="utf-8", errors="replace")
+            if "c-gettimeofday-y" not in vdso_text:
+                problems.append("arch/arm64/kernel/vdso/Makefile 缺失 c-gettimeofday-y 机制")
+
+        # 5) show_map_vma 不允许出现 69_hide_stuff 错位注入的特征
+        task_mmu = common_dir / "fs/proc/task_mmu.c"
+        if task_mmu.exists():
+            mmu_text = task_mmu.read_text(encoding="utf-8", errors="replace")
+            if "dentry = file->f_path.dentry;" in mmu_text and "spoofed_redirected_name" in mmu_text:
+                if mmu_text.find("if (spoofed_redirected_name)") < mmu_text.find("dentry = file->f_path.dentry;"):
+                    problems.append("task_mmu.c 疑似 69_hide_stuff 错位注入（dentry 代码落在 open-redirect 块内）")
+
+        if problems:
+            for p in problems:
+                logger.error(p)
+            raise RuntimeError("编译前注入审计未通过: " + "; ".join(problems))
+        logger.info("编译前注入审计通过")
 
     def apply_zram_patches(self):
         if not self.config.use_zram:
@@ -862,12 +958,15 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             self.add_bbg()
             self.apply_susfs_patches()
             self.apply_sukisu_patches()
+            self.run_external_modules("after_patch")
             self.apply_hide_module()
             self.apply_zram_patches()
             self.apply_task_mmu_fixes()
             self.configure_kernel()
             self.configure_kernel_name()
             self.show_kernel_config()
+            self.verify_patched_tree()
+            self.run_external_modules("before_build")
 
             if not self.build_kernel():
                 return BuildResult(success=False, config=self.config, message="内核编译失败", build_time=time.time() - start_time)

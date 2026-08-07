@@ -65,6 +65,11 @@ on:
         required: false
         type: string
         default: ''
+      custom_external_modules:
+        description: '自定义外部模块（格式: repo;stage 或 set:repo#child;stage，用 | 分隔，stage=after_patch/before_build）'
+        required: false
+        type: string
+        default: ''
       use_zram:
         description: '启用 ZRAM (LZ4KD)'
         required: true
@@ -150,7 +155,57 @@ jobs:
           restore-keys: |
             ${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}-${{ github.event.inputs.sub_level }}-ccache-
 
+      - name: Clone custom external modules
+        if: github.event.inputs.custom_external_modules != ''
+        env:
+          CUSTOM_EXTERNAL_MODULES: ${{ github.event.inputs.custom_external_modules }}
+        run: |
+          set -euo pipefail
+          manifest="$GITHUB_WORKSPACE/custom_external_modules.tsv"
+          : > "$manifest"
+          modules_input="$(printf '%s' "$CUSTOM_EXTERNAL_MODULES" | tr -d '\r')"
+          index=0
+          IFS='|' read -ra blocks <<< "$modules_input"
+          for block in "${blocks[@]}"; do
+            block="$(echo "$block" | xargs)"
+            [ -z "$block" ] && continue
+            entry_kind="module"
+            child_id=""
+            if [[ "$block" == set:* ]]; then
+              entry_kind="set"
+              rest="${block#set:}"
+              repo_url="${rest%%#*}"
+              child_part="${rest#*#}"
+              stage="${child_part##*;}"
+              child_id="${child_part%%;*}"
+            else
+              rest="${block#module:}"
+              repo_url="${rest%%;*}"
+              stage="${rest##*;}"
+            fi
+            [ -z "$repo_url" ] && { echo "::error::外部模块缺少仓库地址: $block"; exit 1; }
+            [ -z "$stage" ] && { echo "::error::外部模块缺少阶段: $block"; exit 1; }
+            case "$stage" in
+              after_patch|before_build) ;;
+              *) echo "::error::外部模块阶段不支持: $stage（仅支持 after_patch / before_build）"; exit 1 ;;
+            esac
+            index=$((index + 1))
+            repo_name="$(basename "$repo_url" .git)"
+            module_dir="$GITHUB_WORKSPACE/custom_external_module_$(printf '%02d' "$index")-$repo_name"
+            git clone --depth 1 "$repo_url" "$module_dir"
+            if [ "$entry_kind" = "set" ]; then
+              module_dir="$module_dir/$child_id"
+              [ -d "$module_dir" ] || { echo "::error::外部模块子目录不存在: $child_id"; exit 1; }
+            fi
+            printf '%s\t%s\t%s\t%s\t%s\n' "$stage" "$module_dir" "$repo_url" "$entry_kind" "${child_id:-}" >> "$manifest"
+            echo "外部模块 #$index [$stage]: $repo_url -> $module_dir"
+          done
+          echo "清单内容:"
+          cat "$manifest"
+
       - name: Build kernel
+        env:
+          CUSTOM_EXTERNAL_MODULES_MANIFEST: ${{ github.workspace }}/custom_external_modules.tsv
         run: |
           cd ./.github/workflows/scripts
 

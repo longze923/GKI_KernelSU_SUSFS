@@ -968,10 +968,11 @@ echo "================================================"
 
 if [ "$FAIL_COUNT" -gt 0 ]; then
     echo ""
-    echo "WARNING: ${FAIL_COUNT} injection(s) failed."
+    echo "ERROR: ${FAIL_COUNT} injection(s) failed."
     echo "This usually means the kernel source anchor line changed."
-    echo "The module will still compile, but the failed hooks won't be active."
+    echo "Refusing to continue with a broken kernel (fail-fast)."
     echo "Check the build log above for [FAIL] entries."
+    exit 1
 fi
 
 # --- 完成 ---
