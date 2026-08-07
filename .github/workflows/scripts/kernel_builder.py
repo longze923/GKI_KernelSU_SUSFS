@@ -467,6 +467,40 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         subprocess.run(cmd, shell=True, cwd=str(self.work_dir), env=env, check=True, timeout=900)
         logger.info("KSU Hide Module 注入完成")
 
+    def apply_gki_assoc_array_fix(self):
+        """GKI 5.15：fragment 会把 CONFIG_ASSOCIATIVE_ARRAY 强制关掉，但 CONFIG_KEYS=y 时
+        key.h 需要 struct assoc_array、keyring.c 需要 assoc_array API。
+        这里把 assoc_array 头文件与 lib 实现改为跟随 CONFIG_KEYS 编译，
+        等价于恢复 KEYS 对 ASSOCIATIVE_ARRAY 的 select。"""
+        common_dir = self.work_dir / "common"
+        header = common_dir / "include/linux/assoc_array.h"
+        if header.exists():
+            text = header.read_text(encoding="utf-8", errors="replace")
+            new = text.replace(
+                "#ifdef CONFIG_ASSOCIATIVE_ARRAY",
+                "#if defined(CONFIG_ASSOCIATIVE_ARRAY) || defined(CONFIG_KEYS)",
+                1,
+            )
+            if new != text:
+                header.write_text(new, encoding="utf-8")
+                logger.info("assoc_array.h: struct/API 跟随 CONFIG_KEYS 编译")
+            else:
+                logger.warning("assoc_array.h: 未找到 #ifdef CONFIG_ASSOCIATIVE_ARRAY")
+
+        lib_makefile = common_dir / "lib/Makefile"
+        if lib_makefile.exists():
+            text = lib_makefile.read_text(encoding="utf-8", errors="replace")
+            new = text.replace(
+                "obj-$(CONFIG_ASSOCIATIVE_ARRAY) += assoc_array.o",
+                "obj-$(CONFIG_KEYS) += assoc_array.o",
+                1,
+            )
+            if new != text:
+                lib_makefile.write_text(new, encoding="utf-8")
+                logger.info("lib/Makefile: assoc_array.o 跟随 CONFIG_KEYS 编译")
+            else:
+                logger.warning("lib/Makefile: 未找到 assoc_array.o 规则")
+
     def apply_zram_patches(self):
         if not self.config.use_zram:
             return
@@ -880,6 +914,7 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             self.apply_susfs_patches()
             self.apply_sukisu_patches()
             self.apply_hide_module()
+            self.apply_gki_assoc_array_fix()
             self.apply_zram_patches()
             self.apply_task_mmu_fixes()
             self.configure_kernel()
