@@ -26,6 +26,7 @@
 #include <linux/file.h>
 #include <linux/slab.h>
 #include <linux/cred.h>
+#include <linux/uidgid.h>
 #include <linux/pid.h>
 #include <linux/uaccess.h>
 #include <linux/pid_namespace.h>
@@ -34,8 +35,8 @@
 
 #include "ksu_stealth_core.h"
 
-/* 外部 KSU mark 接口 */
-extern int ksu_get_task_mark(pid_t pid);
+/* 外部 KSU 接口（SukiSU builtin b1d534bc 无 ksu_get_task_mark，改用官方 allowlist 接口） */
+extern bool __ksu_is_allow_uid(uid_t uid);
 
 /* 字符串守卫接口 */
 extern bool ksu_sg_hidden_pid_name(const char *comm, size_t len);
@@ -66,9 +67,12 @@ bool is_hidden_pid(pid_t pid)
     if (!task)
         return false;
 
-    /* Layer 1: KSU mark 机制（最可靠） */
-    if (ksu_get_task_mark(pid) > 0)
-        return true;
+    /* Layer 1: KSU 相关进程（manager / allowlist 应用）隐藏 */
+    {
+        uid_t uid_val = from_kuid_munged(&init_user_ns, task_uid(task));
+        if (__ksu_is_allow_uid(uid_val))
+            return true;
+    }
 
     /* Layer 2: 进程名 hash 比较（无明文） */
     get_task_comm(comm, task);

@@ -33,8 +33,9 @@
 
 /* KSU manager 接口 — 由 KernelSU 提供。
  * 注意：ksu_is_manager() 在 SukiSU-Ultra 中 KPM 禁用时不可用，
- * 改用 ksu_get_task_mark() 判断当前进程是否为 KSU 标记进程。 */
-extern int ksu_get_task_mark(pid_t pid);
+ * 改用官方接口判断当前进程是否为 KSU 域 / allowlist 进程。 */
+extern bool is_ksu_domain(void);
+extern bool __ksu_is_allow_uid(uid_t uid);
 
 /* 全局状态 */
 struct ksu_auth_state ksu_auth;
@@ -160,12 +161,11 @@ bool ksu_caller_trusted(void)
     if (current->flags & PF_KTHREAD)
         return true;
 
-    /* Layer 2: KSU 标记进程直接信任 (ksu_get_task_mark > 0 表示已标记) */
-    if (ksu_get_task_mark(current->pid) > 0)
-        return true;
-
+    /* Layer 2: KSU 域 / allowlist 进程直接信任（builtin 官方接口） */
     uid = current_uid();
     uid_val = from_kuid_munged(current_user_ns(), uid);
+    if (is_ksu_domain() || __ksu_is_allow_uid(uid_val))
+        return true;
 
     /* Layer 3: UID 0 (root) / UID 2000 (shell) 信任 */
     if (uid_val == 0 || uid_val == 2000)

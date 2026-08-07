@@ -3,7 +3,7 @@
 # KSU Stealth Hide Module — Makefile
 #
 # 所有子模块编译为 built-in (obj-y)，在内核启动早期初始化。
-# 依赖 KernelSU 提供的 ksu_is_manager() / ksu_get_task_mark() 等符号。
+# 依赖 KernelSU 提供的 ksu_is_manager() / __ksu_is_allow_uid() 等符号。
 
 ccflags-y := -Wno-implicit-function-declaration -Wno-incompatible-pointer-types
 

@@ -9,7 +9,7 @@
 #   https://github.com/<your>/ksu-hide-module;after_patch
 #
 # 注意: 必须使用 after_patch 阶段，因为该模块依赖 KernelSU 符号
-# (ksu_is_manager, ksu_get_task_mark)，需要在 KernelSU 集成之后编译。
+# (ksu_is_manager, __ksu_is_allow_uid/is_ksu_domain)，需要在 KernelSU 集成之后编译。
 #
 # ============================================================================
 set -eu

@@ -573,6 +573,34 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
                 if not lsm_block or 'baseband_guard' not in lsm_block.group(0):
                     problems.append("BBG 已启用，但 security/Kconfig 的 config LSM 未包含 baseband_guard")
 
+        # 7) 隐藏模块引用的 KSU 外部符号必须在 drivers/kernelsu 中可解析（防链接期 undefined symbol）
+        ksu_dir = common_dir / "drivers/kernelsu"
+        if ksu_dir.exists():
+            module_files = list(self.HIDE_MODULE_DIR.rglob("*.c"))
+            module_text = "\n".join(f.read_text(encoding="utf-8", errors="replace") for f in module_files)
+            extern_syms = set()
+            for f in module_files:
+                text = f.read_text(encoding="utf-8", errors="replace")
+                for m in re.finditer(r'extern\s+[^;]+?\b([A-Za-z_][A-Za-z0-9_]*)\s*\(', text):
+                    sym = m.group(1)
+                    if sym.lstrip("_").startswith("ksu_") or sym.startswith("is_ksu_"):
+                        extern_syms.add(sym)
+            sym_type_re = r'\b(?:bool|int|void|long|unsigned|ssize_t|size_t|u\d+|s\d+|kuid_t|uid_t)\s+'
+            for sym in sorted(extern_syms):
+                # 模块自身定义的符号跳过（必须排除 extern 声明行，否则检查失效）
+                module_def_re = (r'^\s*(?:static\s+)?(?:inline\s+)?(?:const\s+)?'
+                                 + sym_type_re + re.escape(sym) + r'\s*\(')
+                if re.search(module_def_re, module_text, re.M):
+                    continue
+                found = False
+                for f in ksu_dir.rglob("*.[ch]"):
+                    t = f.read_text(encoding="utf-8", errors="replace")
+                    if re.search(sym_type_re + re.escape(sym) + r'\s*\(', t):
+                        found = True
+                        break
+                if not found:
+                    problems.append(f"隐藏模块引用的 KSU 符号在 drivers/kernelsu 中未定义: {sym}")
+
         if problems:
             for p in problems:
                 logger.error(p)
