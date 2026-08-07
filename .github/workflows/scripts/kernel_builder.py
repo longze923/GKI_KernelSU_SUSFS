@@ -278,14 +278,25 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         if kconfig_file.exists():
             with open(kconfig_file, "r") as f:
                 content = f.read()
-            # 只把 baseband_guard 追加进 config LSM 的 default 值（兼容带引号的字符串形式）
-            content = re.sub(r'(config LSM\b.*?\n\s*default\s+)(\S+)',
-                             lambda m: m.group(1) + m.group(2)[:-1] + ',baseband_guard"'
-                             if m.group(2).startswith('"') and m.group(2).endswith('"') and 'lockdown' in m.group(2) and 'baseband_guard' not in m.group(2)
-                             else (m.group(1) + m.group(2) + ',baseband_guard'
-                                   if 'lockdown' in m.group(2) and 'baseband_guard' not in m.group(2)
-                                   else m.group(1) + m.group(2)),
-                             content, flags=re.DOTALL)
+            # config LSM 有多个带条件 default（SMACK/APPARMOR/TOMOYO/DAC）以及
+            # 最后无条件的兜底 default；GKI 实际生效的是兜底那行。必须像 ABK 一样
+            # 把块内所有 default 行都处理：在 selinux 后追加 baseband_guard，
+            # 否则 CONFIG_LSM 里没有 baseband_guard，BBG Makefile 会直接报错。
+            lines = content.splitlines(keepends=True)
+            in_lsm = False
+            for idx, line in enumerate(lines):
+                if re.match(r'^\s*config LSM\s*$', line):
+                    in_lsm = True
+                    continue
+                if in_lsm:
+                    if re.match(r'^\s*help\b', line):
+                        in_lsm = False
+                        continue
+                    m = re.match(r'^(\s*default\s+")([^"]*)("[^\n]*\n?)$', line)
+                    if m and 'baseband_guard' not in m.group(2) and 'selinux' in m.group(2):
+                        lines[idx] = (m.group(1) + m.group(2).replace('selinux', 'selinux,baseband_guard', 1)
+                                      + m.group(3))
+            content = "".join(lines)
             with open(kconfig_file, "w") as f:
                 f.write(content)
         self._bbg_generate_flask_headers(common_dir)
@@ -552,6 +563,15 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             if "dentry = file->f_path.dentry;" in mmu_text and "spoofed_redirected_name" in mmu_text:
                 if mmu_text.find("if (spoofed_redirected_name)") < mmu_text.find("dentry = file->f_path.dentry;"):
                     problems.append("task_mmu.c 疑似 69_hide_stuff 错位注入（dentry 代码落在 open-redirect 块内）")
+
+        # 6) BBG 启用时，config LSM 必须包含 baseband_guard，否则 BBG Makefile 直接报错
+        if self.config.use_bbg:
+            kconfig_file = common_dir / "security/Kconfig"
+            if kconfig_file.exists():
+                kconfig_text = kconfig_file.read_text(encoding="utf-8", errors="replace")
+                lsm_block = re.search(r'config LSM\b.*?\n\s*help\b', kconfig_text, re.S)
+                if not lsm_block or 'baseband_guard' not in lsm_block.group(0):
+                    problems.append("BBG 已启用，但 security/Kconfig 的 config LSM 未包含 baseband_guard")
 
         if problems:
             for p in problems:
