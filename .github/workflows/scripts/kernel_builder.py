@@ -538,9 +538,21 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             else:
                 f.write("CONFIG_KSU_SUSFS_SUS_PATH=n\n")
             # GKI 5.15 的 key.h 在 CONFIG_KEYS=y 时无条件使用 struct assoc_array，
-            # 结构体定义由 CONFIG_ASSOCIATIVE_ARRAY 控制，必须显式开启
+            # 结构体定义由 assoc_array.h 里的 #ifdef 符号控制（不同内核版本可能是
+            # CONFIG_ASSOCIATIVE_ARRAY 或旧名 CONFIG_ASSOC_ARRAY），按实际源码开启
             f.write("CONFIG_KEYS=y\n")
-            f.write("CONFIG_ASSOCIATIVE_ARRAY=y\n")
+            assoc_h = self.work_dir / "common/include/linux/assoc_array.h"
+            if assoc_h.exists():
+                assoc_text = assoc_h.read_text(encoding="utf-8", errors="replace")
+                m = re.search(r'#\s*ifdef\s+(CONFIG_[A-Z_]+)[^\n]*\n(?:[^\n]*\n)*?\s*struct assoc_array\s*\{', assoc_text)
+                if m:
+                    sym = m.group(1)
+                    f.write(f"{sym}=y\n")
+                    logger.info(f"assoc_array 由 {sym} 控制，已显式开启")
+                else:
+                    logger.warning("assoc_array.h 中未找到 struct assoc_array 的 #ifdef，跳过")
+            else:
+                logger.warning("assoc_array.h 不存在，跳过")
 
         if self.config.use_zram:
             self._configure_zram()
